@@ -1,403 +1,413 @@
 import numpy as np
-import math
-from collections import defaultdict, deque
-from typing import List, Tuple, Dict, Optional
+import json
+from collections import defaultdict
 
 class Agent:
-    def __init__(self, player: str, env_cfg: dict):
+    def __init__(self, player, env_cfg):
         self.player = player
-        self.opponent = "player_1" if player == "player_0" else "player_0"
         self.env_cfg = env_cfg
-        
-        # Parámetros del juego (se estiman dinámicamente)
-        self.params = {
-            "unit_move_cost": 3.0,
-            "unit_sap_range": 5,
-            "unit_sap_cost": 40,
-            "unit_sensor_range": 3,
-            "relic_score_radius": 2,  # estimado
-        }
-        
-        # Conocimiento del mapa
-        self.map_size = 24
-        self.map_explored = np.zeros((self.map_size, self.map_size), dtype=bool)
-        self.map_visited = np.zeros((self.map_size, self.map_size), dtype=int)  # contador de visitas
-        
-        # Nodos conocidos
-        self.relic_nodes = []          # lista de (x, y)
-        self.relic_tiles = {}          # (x, y) -> score acumulado (para descubrir tiles que dan puntos)
-        self.energy_nodes = []         # lista de (x, y)
-        
-        # Unidades enemigas observadas (histórico)
-        self.enemy_positions_history = deque(maxlen=20)
-        self.enemy_energy_history = deque(maxlen=20)
+        self.step = 0
+        self.day = 0
+        self.turn = 0
         
         # Estado interno
-        self.match_number = 0
-        self.step = 0
-        self.unit_roles = {}  # unit_id -> "explorer", "attacker", "supporter"
-        self.unit_targets = {}  # unit_id -> (x, y)
+        self.farmer_pos = None
+        self.hands_pos = []
+        self.tiles = None
+        self.money = 0
+        self.shed = {}
+        self.seeds = {}
+        self.inventories = []
         
-        # Exploración por frontera
-        self.frontier_cells = []
+        # Estrategia
+        self.phase = "early"  # early, mid, late
+        self.crops_planted = 0
+        self.animals_placed = 0
+        self.quadrants_bought = 0
         
-        # Sistema de votación para objetivos
-        self.relic_priority = {}  # (x, y) -> prioridad (mayor = mejor)
+        # Planificación
+        self.plants = {}  # (x,y) -> info
+        self.animals = {}  # (x,y) -> info
         
-        # Últimas acciones
-        self.last_actions = {}
+        # Umbrales
+        self.WHEAT_PRICE = 25
+        self.CARROT_PRICE = 35
+        self.TOMATO_PRICE = 60
+        self.STRAWBERRY_PRICE = 120
+        self.MELON_PRICE = 250
         
-    def act(self, step: int, obs, remainingOverageTime: int = 60):
-        self.step = step
-        actions = {}
+    def act(self, obs):
+        """Acción principal del agente."""
+        self.step = obs.get("step", 0)
+        self.day = obs.get("day", 0)
+        self.turn = obs.get("hour", 0)
         
-        # 1. Actualizar todo el conocimiento
-        self._update_knowledge(obs)
+        # Actualizar estado
+        self._update_state(obs)
         
-        # 2. Estimar parámetros del juego
-        self._estimate_params(obs)
+        # Determinar fase
+        self._determine_phase()
         
-        # 3. Decidir roles de las unidades (solo al inicio)
-        team_obs = obs["team_obs"][self.player]
-        units = team_obs["units"]
-        unit_mask = team_obs["unit_mask"]
-        num_units = sum(unit_mask)
-        if step % 10 == 0 or not self.unit_roles:
-            self._assign_roles(units, unit_mask, num_units)
+        # Generar acciones
+        farmer_actions = []
+        market_actions = []
         
-        # 4. Calcular prioridades de los nodos de reliquia
-        self._compute_relic_priorities(obs)
+        # 1. Acciones de mercado (siempre primero)
+        market_actions.extend(self._market_actions(obs))
         
-        # 5. Para cada unidad, decidir acción
-        for unit_id in range(len(units)):
-            if not unit_mask[unit_id]:
-                continue
-            unit = units[unit_id]
-            pos = (unit["x"], unit["y"])
-            energy = unit["energy"]
-            
-            # Obtener rol
-            role = self.unit_roles.get(unit_id, "explorer")
-            
-            # Decidir acción según rol y situación
-            if energy < 25:
-                action = self._action_recharge(unit, obs)
-            elif role == "explorer" and self.match_number == 0:
-                action = self._action_explore_frontier(unit, obs)
-            elif role == "attacker":
-                action = self._action_attack(unit, obs)
-            else:  # supporter o explotación
-                action = self._action_harvest(unit, obs)
-            
-            # Asegurar que la acción sea válida (dentro de [-1,1] y sap dentro de [-24,24])
-            action = self._sanitize_action(action)
-            actions[unit_id] = action
-            self.last_actions[unit_id] = action
+        # 2. Acciones del agricultor principal
+        farmer_actions = self._farmer_actions(obs)
+        
+        # 3. Acciones de los trabajadores (si hay)
+        hand_actions = self._hand_actions(obs)
+        
+        return {
+            "farmer": farmer_actions,
+            "hands": hand_actions,
+            "market": market_actions
+        }
+    
+    def _update_state(self, obs):
+        """Actualiza el conocimiento interno."""
+        player = obs["player"]
+        farm = obs["farms"][player]
+        private = obs["private"]
+        
+        self.farmer_pos = tuple(farm["farmer"])
+        self.hands_pos = [tuple(h) for h in farm["hands"]]
+        self.tiles = farm["tiles"]
+        self.money = farm["money"]
+        self.shed = private.get("shed", {})
+        self.seeds = private.get("seeds", {})
+        self.inventories = private.get("inventories", [])
+    
+    def _determine_phase(self):
+        """Determina la fase del juego según el día."""
+        if self.day <= 5:
+            self.phase = "early"
+        elif self.day <= 15:
+            self.phase = "mid"
+        else:
+            self.phase = "late"
+    
+    def _market_actions(self, obs):
+        """Acciones de mercado."""
+        actions = []
+        player = obs["player"]
+        farm = obs["farms"][player]
+        private = obs["private"]
+        market = obs["market"]
+        
+        # Estrategia de compra/venta según fase
+        
+        # 1. Comprar semillas de trigo al inicio
+        if self.phase == "early":
+            # Comprar semillas de trigo si no tenemos y hay dinero
+            if private["seeds"].get("WHEAT", 0) < 5 and farm["money"] >= 50:
+                actions.append(["BUY_SEED", "WHEAT", 5])
+            # Comprar fertilizante si tenemos dinero extra
+            if private["shed"].get("FERTILIZER", 0) < 3 and farm["money"] >= 300:
+                actions.append(["BUY_PRODUCT", "FERTILIZER", 3])
+        
+        # 2. Fase media: diversificar
+        elif self.phase == "mid":
+            # Comprar semillas de zanahoria y tomate
+            if private["seeds"].get("CARROT", 0) < 3 and farm["money"] >= 60:
+                actions.append(["BUY_SEED", "CARROT", 3])
+            if private["seeds"].get("TOMATO", 0) < 2 and farm["money"] >= 100:
+                actions.append(["BUY_SEED", "TOMATO", 2])
+            # Comprar animales (gansos) para huevos
+            if private["shed"].get("GOOSE", 0) < 2 and farm["money"] >= 600:
+                actions.append(["BUY_ANIMAL", "GOOSE", 2])
+        
+        # 3. Fase tardía: comprar tierras y más animales
+        elif self.phase == "late":
+            # Comprar tierras si hay dinero y no todas compradas
+            if len(farm["unlocked_quadrants"]) < 4 and farm["money"] >= 1000:
+                actions.append(["BUY_LAND"])
+            # Comprar más animales si hay espacio
+            if private["shed"].get("GOOSE", 0) < 4 and farm["money"] >= 1200:
+                actions.append(["BUY_ANIMAL", "GOOSE", 2])
+            if private["shed"].get("COW", 0) < 2 and farm["money"] >= 800:
+                actions.append(["BUY_ANIMAL", "COW", 1])
+        
+        # 4. Vender productos estratégicamente
+        # Vender trigo cuando el precio es bueno (>25)
+        wheat_in_shed = private["shed"].get("WHEAT", 0)
+        if wheat_in_shed > 0:
+            price = market["prices"].get("WHEAT", 25)
+            if price >= 30 or (self.phase == "late" and wheat_in_shed > 10):
+                actions.append(["SELL", "WHEAT", wheat_in_shed])
+        
+        # Vender zanahorias
+        carrot_in_shed = private["shed"].get("CARROT", 0)
+        if carrot_in_shed > 0 and self.phase != "early":
+            price = market["prices"].get("CARROT", 35)
+            if price >= 40 or (self.phase == "late" and carrot_in_shed > 5):
+                actions.append(["SELL", "CARROT", carrot_in_shed])
+        
+        # Vender tomates
+        tomato_in_shed = private["shed"].get("TOMATO", 0)
+        if tomato_in_shed > 0 and self.phase != "early":
+            price = market["prices"].get("TOMATO", 60)
+            if price >= 70 or (self.phase == "late" and tomato_in_shed > 3):
+                actions.append(["SELL", "TOMATO", tomato_in_shed])
+        
+        # Vender huevos (si los hay)
+        eggs_in_shed = private["shed"].get("EGG", 0)
+        if eggs_in_shed > 0 and self.phase != "early":
+            price = market["prices"].get("EGG", 50)
+            if price >= 55 or self.phase == "late":
+                actions.append(["SELL", "EGG", eggs_in_shed])
+        
+        # Vender fertilizante si tenemos demasiado
+        fert_in_shed = private["shed"].get("FERTILIZER", 0)
+        if fert_in_shed > 5 and self.phase == "late":
+            actions.append(["SELL", "FERTILIZER", fert_in_shed - 5])
+        
+        # Contratar trabajadores (máximo 3-4 al día)
+        if farm["hires_today"] < 3 and self.phase != "early":
+            actions.append(["HIRE"])
         
         return actions
     
-    def _update_knowledge(self, obs):
-        """Actualiza mapa explorado, nodos y enemigos."""
-        team_obs = obs["team_obs"][self.player]
-        sensor_mask = team_obs["sensor_mask"]
+    def _farmer_actions(self, obs):
+        """Acciones del agricultor principal."""
+        actions = []
+        player = obs["player"]
+        farm = obs["farms"][player]
+        private = obs["private"]
         
-        # Casillas visibles
-        visible = np.where(sensor_mask > 0)
-        for y, x in zip(visible[0], visible[1]):
-            if 0 <= x < self.map_size and 0 <= y < self.map_size:
-                self.map_explored[y, x] = True
-                self.map_visited[y, x] += 1
+        x, y = farm["farmer"]
+        tile = farm["tiles"][y][x]
         
-        # Nodos de reliquia
-        relic_nodes = obs["relic_nodes"]
-        relic_mask = obs["relic_nodes_mask"]
-        for i in range(len(relic_nodes)):
-            if relic_mask[i]:
-                pos = (relic_nodes[i]["x"], relic_nodes[i]["y"])
-                if pos not in self.relic_nodes:
-                    self.relic_nodes.append(pos)
-        
-        # Nodos de energía
-        energy_nodes = obs["energy_nodes"]
-        energy_mask = obs["energy_nodes_mask"]
-        for i in range(len(energy_nodes)):
-            if energy_mask[i]:
-                pos = (energy_nodes[i]["x"], energy_nodes[i]["y"])
-                if pos not in self.energy_nodes:
-                    self.energy_nodes.append(pos)
-        
-        # Detectar tiles de reliquia que dan puntos (cuando la puntuación aumenta)
-        # No tenemos acceso directo a la puntuación, pero podemos inferir si estamos en un tile que da puntos
-        # al observar que el marcador de reliquia cambia. Como no se da explícitamente, usaremos heurística:
-        # si estamos cerca de un nodo de reliquia y el equipo obtiene puntos, lo registramos.
-        # (En la práctica, se puede leer el score de la observación, pero no está en el API público)
-        # En su lugar, marcaremos todas las casillas alrededor de los nodos como potenciales.
-        for rx, ry in self.relic_nodes:
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    tx, ty = rx + dx, ry + dy
-                    if 0 <= tx < self.map_size and 0 <= ty < self.map_size:
-                        if (tx, ty) not in self.relic_tiles:
-                            self.relic_tiles[(tx, ty)] = 0
-        
-        # Enemigos visibles
-        opponent_obs = obs["team_obs"][self.opponent]
-        opp_units = opponent_obs["units"]
-        opp_mask = opponent_obs["unit_mask"]
-        for i in range(len(opp_units)):
-            if opp_mask[i]:
-                pos = (opp_units[i]["x"], opp_units[i]["y"])
-                self.enemy_positions_history.append(pos)
-                self.enemy_energy_history.append(opp_units[i]["energy"])
-        
-        # Actualizar frontera (casillas exploradas con vecinos no explorados)
-        self._update_frontier()
-    
-    def _update_frontier(self):
-        """Encuentra las casillas de frontera para exploración."""
-        frontier = []
-        for y in range(self.map_size):
-            for x in range(self.map_size):
-                if self.map_explored[y, x]:
-                    # Revisar vecinos
-                    for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
-                        ny, nx = y+dy, x+dx
-                        if 0 <= ny < self.map_size and 0 <= nx < self.map_size:
-                            if not self.map_explored[ny, nx]:
-                                frontier.append((x, y))
-                                break
-        self.frontier_cells = frontier
-    
-    def _estimate_params(self, obs):
-        """Estima parámetros del juego observando acciones y cambios de energía."""
-        team_obs = obs["team_obs"][self.player]
-        units = team_obs["units"]
-        unit_mask = team_obs["unit_mask"]
-        
-        # Estimar coste de movimiento: comparar energía entre pasos
-        # (esto requiere guardar energía previa, lo hacemos en un buffer)
-        if not hasattr(self, 'prev_energy'):
-            self.prev_energy = {}
-        
-        for i in range(len(units)):
-            if unit_mask[i]:
-                uid = i
-                energy = units[i]["energy"]
-                if uid in self.prev_energy:
-                    delta = self.prev_energy[uid] - energy
-                    # Si delta > 0 y la unidad se movió, es el coste de movimiento
-                    # Pero puede incluir recarga o daño. Asumimos que si se movió, coste = delta
-                    if uid in self.last_actions and self.last_actions[uid][0:2] != [0,0]:
-                        if delta > 0:
-                            self.params["unit_move_cost"] = 0.9 * self.params["unit_move_cost"] + 0.1 * delta
-                self.prev_energy[uid] = energy
-        
-        # Estimar rango de sap viendo ataques enemigos (enemigos atacan a distancia)
-        # No tenemos acceso a las acciones enemigas, pero podemos inferir rango por distancia a la que nos atacan
-        # (esto es complejo, lo dejamos como está)
-        # También podemos usar la configuración del entorno si está disponible
-        if "unit_sap_range" in self.env_cfg:
-            self.params["unit_sap_range"] = self.env_cfg["unit_sap_range"]
-        if "unit_sap_cost" in self.env_cfg:
-            self.params["unit_sap_cost"] = self.env_cfg["unit_sap_cost"]
-        if "unit_move_cost" in self.env_cfg:
-            self.params["unit_move_cost"] = self.env_cfg["unit_move_cost"]
-    
-    def _assign_roles(self, units, unit_mask, num_units):
-        """Asigna roles a las unidades según el número y la fase del juego."""
-        self.unit_roles = {}
-        unit_ids = [i for i in range(len(units)) if unit_mask[i]]
-        
-        if num_units == 0:
-            return
-        
-        # En partida 1: todos exploradores
-        if self.match_number == 0:
-            for uid in unit_ids:
-                self.unit_roles[uid] = "explorer"
-            return
-        
-        # En partidas posteriores: mezcla de atacantes y recolectores
-        # Ordenar por energía (los que tienen más energía son atacantes)
-        sorted_units = sorted(unit_ids, key=lambda uid: units[uid]["energy"], reverse=True)
-        
-        # Los 2 con más energía son atacantes, el resto son recolectores
-        num_attackers = min(2, num_units)
-        for i, uid in enumerate(sorted_units):
-            if i < num_attackers:
-                self.unit_roles[uid] = "attacker"
-            else:
-                self.unit_roles[uid] = "supporter"
-    
-    def _compute_relic_priorities(self, obs):
-        """Calcula prioridad de cada nodo de reliquia (distancia, presencia enemiga)."""
-        team_obs = obs["team_obs"][self.player]
-        units = team_obs["units"]
-        unit_mask = team_obs["unit_mask"]
-        
-        # Calcular centro de masa de nuestras unidades
-        our_positions = []
-        for i in range(len(units)):
-            if unit_mask[i]:
-                our_positions.append((units[i]["x"], units[i]["y"]))
-        if not our_positions:
-            return
-        
-        center_x = np.mean([p[0] for p in our_positions])
-        center_y = np.mean([p[1] for p in our_positions])
-        
-        # Enemigos visibles
-        opponent_obs = obs["team_obs"][self.opponent]
-        opp_units = opponent_obs["units"]
-        opp_mask = opponent_obs["unit_mask"]
-        enemy_positions = []
-        for i in range(len(opp_units)):
-            if opp_mask[i]:
-                enemy_positions.append((opp_units[i]["x"], opp_units[i]["y"]))
-        
-        # Calcular prioridad de cada nodo de reliquia
-        for relic in self.relic_nodes:
-            dist_to_us = abs(relic[0] - center_x) + abs(relic[1] - center_y)
-            # Distancia al enemigo más cercano
-            if enemy_positions:
-                min_enemy_dist = min(abs(relic[0] - ex) + abs(relic[1] - ey) for ex, ey in enemy_positions)
-            else:
-                min_enemy_dist = 100
+        # 1. Si estamos en un tile con planta, gestionarla
+        if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+            crop = tile.get("crop")
+            planted_day = tile.get("planted_day", self.day)
+            age = self.day - planted_day
             
-            # Prioridad: queremos nodos cercanos a nosotros y lejos del enemigo
-            priority = -dist_to_us + 0.5 * min_enemy_dist
-            self.relic_priority[relic] = priority
-    
-    def _action_recharge(self, unit, obs):
-        """Recarga energía yendo al nodo de energía más cercano."""
-        pos = (unit["x"], unit["y"])
-        if pos in self.energy_nodes:
-            return [0, 0, 0, 0]  # ya está cargando
+            # Fertilizar si es el momento adecuado
+            if tile.get("fertilized_until_day", -1) < 0 and private["shed"].get("FERTILIZER", 0) > 0:
+                if crop in ["WHEAT", "CARROT"] and age <= 2:
+                    actions.append(["FERTILIZE"])
+                    return {"farmer": actions, "hands": [], "market": []}
+            
+            # Regar si no se ha regado hoy
+            if not tile.get("watered_today", False):
+                actions.append(["WATER"])
+                return {"farmer": actions, "hands": [], "market": []}
+            
+            # Cosechar si está listo
+            yield_units = tile.get("yield_units", 0)
+            if yield_units > 0:
+                # Si es trigo o zanahoria y tienen suficiente rendimiento
+                if crop in ["WHEAT", "CARROT"]:
+                    if yield_units >= 3:  # mínimo aceptable
+                        actions.append(["HARVEST"])
+                        return {"farmer": actions, "hands": [], "market": []}
+                elif crop in ["TOMATO", "STRAWBERRY"]:
+                    if yield_units >= 2:
+                        actions.append(["HARVEST"])
+                        return {"farmer": actions, "hands": [], "market": []}
+                elif crop == "MELON":
+                    if yield_units >= 4:
+                        actions.append(["HARVEST"])
+                        return {"farmer": actions, "hands": [], "market": []}
         
-        if self.energy_nodes:
-            # Elegir el nodo de energía más cercano
-            closest = min(self.energy_nodes, key=lambda p: abs(p[0]-pos[0]) + abs(p[1]-pos[1]))
-            dx = np.clip(closest[0] - pos[0], -1, 1)
-            dy = np.clip(closest[1] - pos[1], -1, 1)
-            return [dx, dy, 0, 0]
-        else:
-            # Si no hay nodos de energía conocidos, explorar
-            return self._action_explore_frontier(unit, obs)
-    
-    def _action_explore_frontier(self, unit, obs):
-        """Se mueve hacia la frontera más cercana."""
-        pos = (unit["x"], unit["y"])
-        if not self.frontier_cells:
-            # Si no hay frontera, ir al centro
-            center = (12, 12)
-            dx = np.clip(center[0] - pos[0], -1, 1)
-            dy = np.clip(center[1] - pos[1], -1, 1)
-            return [dx, dy, 0, 0]
+        # 2. Si estamos en un tile con animal
+        elif isinstance(tile, dict) and tile.get("kind") in ["COOP", "PASTURE"]:
+            animal = tile.get("animal")
+            if animal:
+                # Alimentar si no se ha alimentado hoy
+                if not tile.get("fed_today", False):
+                    # Necesitamos trigo para alimentar
+                    if private["shed"].get("WHEAT", 0) > 0:
+                        # Para alimentar, el agricultor debe tener trigo en inventario
+                        # Como no podemos mover items del shed al inventario directamente,
+                        # usamos PICKUP si estamos cerca del shed o simplemente PASS
+                        # y esperamos que el trabajador lo haga.
+                        # Por simplicidad, asumimos que los trabajadores alimentan.
+                        pass
+                # Cuidar si no se ha cuidado hoy
+                if not tile.get("cared_today", False):
+                    actions.append(["CARE"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                # Recolectar productos
+                if tile.get("yield_units", 0) > 0:
+                    actions.append(["HARVEST"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                # Recolectar fertilizante
+                if tile.get("fertilizer_available", False):
+                    actions.append(["COLLECT_FERTILIZER"])
+                    return {"farmer": actions, "hands": [], "market": []}
         
-        # Encontrar la frontera más cercana (con menos visitas)
+        # 3. Si estamos en un tile vacío y tenemos semillas, plantar
+        if tile is None:
+            # Prioridad de cultivos según fase
+            if self.phase == "early":
+                if private["seeds"].get("WHEAT", 0) > 0:
+                    actions.append(["PLANT", "WHEAT"])
+                    return {"farmer": actions, "hands": [], "market": []}
+            elif self.phase == "mid":
+                # Mezcla de cultivos
+                if private["seeds"].get("CARROT", 0) > 0:
+                    actions.append(["PLANT", "CARROT"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                elif private["seeds"].get("TOMATO", 0) > 0:
+                    actions.append(["PLANT", "TOMATO"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                elif private["seeds"].get("WHEAT", 0) > 0:
+                    actions.append(["PLANT", "WHEAT"])
+                    return {"farmer": actions, "hands": [], "market": []}
+            else:  # late
+                # Cultivos más rentables
+                if private["seeds"].get("MELON", 0) > 0:
+                    actions.append(["PLANT", "MELON"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                elif private["seeds"].get("STRAWBERRY", 0) > 0:
+                    actions.append(["PLANT", "STRAWBERRY"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                elif private["seeds"].get("CARROT", 0) > 0:
+                    actions.append(["PLANT", "CARROT"])
+                    return {"farmer": actions, "hands": [], "market": []}
+                elif private["seeds"].get("WHEAT", 0) > 0:
+                    actions.append(["PLANT", "WHEAT"])
+                    return {"farmer": actions, "hands": [], "market": []}
+        
+        # 4. Si tenemos animales en el shed, colocarlos en estructuras
+        if private["shed"].get("GOOSE", 0) > 0:
+            # Buscar un coop vacío cerca
+            coop_pos = self._find_empty_structure("COOP")
+            if coop_pos and self._is_adjacent_to_shed(x, y, coop_pos[0], coop_pos[1]):
+                actions.append(["PLACE", "GOOSE", 1])
+                return {"farmer": actions, "hands": [], "market": []}
+        
+        if private["shed"].get("COW", 0) > 0:
+            pasture_pos = self._find_empty_structure("PASTURE")
+            if pasture_pos and self._is_adjacent_to_shed(x, y, pasture_pos[0], pasture_pos[1]):
+                actions.append(["PLACE", "COW", 1])
+                return {"farmer": actions, "hands": [], "market": []}
+        
+        # 5. Si no hay nada que hacer, moverse a un tile útil
+        # Buscar tile vacío más cercano
+        target = self._find_nearest_empty_tile()
+        if target:
+            dx = target[0] - x
+            dy = target[1] - y
+            if dx < 0:
+                actions.append(["MOVE", "WEST"])
+            elif dx > 0:
+                actions.append(["MOVE", "EAST"])
+            elif dy < 0:
+                actions.append(["MOVE", "NORTH"])
+            elif dy > 0:
+                actions.append(["MOVE", "SOUTH"])
+            return {"farmer": actions, "hands": [], "market": []}
+        
+        # Si todo falla, PASS
+        actions.append(["PASS"])
+        return {"farmer": actions, "hands": [], "market": []}
+    
+    def _hand_actions(self, obs):
+        """Acciones de los trabajadores."""
+        hands_actions = []
+        player = obs["player"]
+        farm = obs["farms"][player]
+        private = obs["private"]
+        
+        for i, (hx, hy) in enumerate(farm["hands"]):
+            tile = farm["tiles"][hy][hx]
+            actions = []
+            
+            # Trabajadores se encargan de tareas repetitivas: regar, alimentar, cosechar
+            if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                # Regar si no se ha regado hoy
+                if not tile.get("watered_today", False):
+                    actions.append(["WATER"])
+                # Cosechar si tiene rendimiento
+                elif tile.get("yield_units", 0) > 0:
+                    actions.append(["HARVEST"])
+                else:
+                    actions.append(["PASS"])
+            
+            elif isinstance(tile, dict) and tile.get("kind") in ["COOP", "PASTURE"]:
+                animal = tile.get("animal")
+                if animal:
+                    # Recolectar productos
+                    if tile.get("yield_units", 0) > 0:
+                        actions.append(["HARVEST"])
+                    # Recolectar fertilizante
+                    elif tile.get("fertilizer_available", False):
+                        actions.append(["COLLECT_FERTILIZER"])
+                    # Cuidar si no se ha cuidado
+                    elif not tile.get("cared_today", False):
+                        actions.append(["CARE"])
+                    else:
+                        actions.append(["PASS"])
+                else:
+                    # Construir estructuras para animales
+                    if private["shed"].get("GOOSE", 0) > 0:
+                        actions.append(["BUILD_COOP"])
+                    elif private["shed"].get("COW", 0) > 0:
+                        actions.append(["BUILD_PASTURE"])
+                    else:
+                        actions.append(["PASS"])
+            
+            # Si el tile está vacío y tenemos semillas, plantar
+            elif tile is None:
+                if private["seeds"].get("WHEAT", 0) > 0:
+                    actions.append(["PLANT", "WHEAT"])
+                elif private["seeds"].get("CARROT", 0) > 0:
+                    actions.append(["PLANT", "CARROT"])
+                elif private["seeds"].get("TOMATO", 0) > 0:
+                    actions.append(["PLANT", "TOMATO"])
+                else:
+                    actions.append(["PASS"])
+            
+            # Si hay una maleza, cavar
+            elif isinstance(tile, dict) and tile.get("kind") == "WEED":
+                actions.append(["DIG"])
+            
+            else:
+                actions.append(["PASS"])
+            
+            hands_actions.append(actions)
+        
+        return hands_actions
+    
+    def _find_empty_tile(self, farm_tiles):
+        """Busca un tile vacío en la granja."""
+        for y in range(len(farm_tiles)):
+            for x in range(len(farm_tiles[y])):
+                if farm_tiles[y][x] is None:
+                    return (x, y)
+        return None
+    
+    def _find_nearest_empty_tile(self):
+        """Encuentra el tile vacío más cercano al agricultor."""
+        x, y = self.farmer_pos
         best = None
-        best_score = float('inf')
-        for fx, fy in self.frontier_cells:
-            dist = abs(fx - pos[0]) + abs(fy - pos[1])
-            # Penalizar casillas ya visitadas
-            visits = self.map_visited[fy, fx]
-            score = dist + 0.5 * visits
-            if score < best_score:
-                best_score = score
-                best = (fx, fy)
-        
-        if best:
-            dx = np.clip(best[0] - pos[0], -1, 1)
-            dy = np.clip(best[1] - pos[1], -1, 1)
-            return [dx, dy, 0, 0]
-        return [0, 0, 0, 0]
+        best_dist = float('inf')
+        for yy in range(len(self.tiles)):
+            for xx in range(len(self.tiles[yy])):
+                if self.tiles[yy][xx] is None:
+                    dist = abs(xx - x) + abs(yy - y)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = (xx, yy)
+        return best
     
-    def _action_attack(self, unit, obs):
-        """Estrategia de ataque: persigue y ataca enemigos vulnerables."""
-        pos = (unit["x"], unit["y"])
-        energy = unit["energy"]
-        
-        opponent_obs = obs["team_obs"][self.opponent]
-        opp_units = opponent_obs["units"]
-        opp_mask = opponent_obs["unit_mask"]
-        
-        # Lista de enemigos visibles con su energía y distancia
-        enemies = []
-        for i in range(len(opp_units)):
-            if opp_mask[i]:
-                enemy_pos = (opp_units[i]["x"], opp_units[i]["y"])
-                enemy_energy = opp_units[i]["energy"]
-                dist = abs(enemy_pos[0] - pos[0]) + abs(enemy_pos[1] - pos[1])
-                enemies.append((enemy_pos, enemy_energy, dist))
-        
-        # Ordenar enemigos por: bajo energy, cerca
-        enemies.sort(key=lambda e: (e[1], e[2]))
-        
-        for enemy_pos, enemy_energy, dist in enemies:
-            # Si el enemigo está en rango de sap y tenemos suficiente energía
-            sap_cost = self.params["unit_sap_cost"]
-            sap_range = self.params["unit_sap_range"]
-            
-            if dist <= sap_range and energy >= sap_cost:
-                # Atacar
-                dx_sap = enemy_pos[0] - pos[0]
-                dy_sap = enemy_pos[1] - pos[1]
-                return [0, 0, dx_sap, dy_sap]
-            
-            # Si el enemigo está a 1-2 pasos de distancia, acercarse para atacar
-            elif dist <= sap_range + 2 and energy >= 50:
-                dx = np.clip(enemy_pos[0] - pos[0], -1, 1)
-                dy = np.clip(enemy_pos[1] - pos[1], -1, 1)
-                return [dx, dy, 0, 0]
-        
-        # Si no hay enemigos cercanos, ir a un nodo de reliquia
-        return self._action_harvest(unit, obs)
+    def _find_empty_structure(self, kind):
+        """Encuentra una estructura vacía del tipo especificado."""
+        for y in range(len(self.tiles)):
+            for x in range(len(self.tiles[y])):
+                tile = self.tiles[y][x]
+                if isinstance(tile, dict) and tile.get("kind") == kind:
+                    if tile.get("animal") is None:
+                        return (x, y)
+        return None
     
-    def _action_harvest(self, unit, obs):
-        """Recolecta puntos en nodos de reliquia con mayor prioridad."""
-        pos = (unit["x"], unit["y"])
-        
-        if not self.relic_nodes:
-            # Si no hay nodos, explorar
-            return self._action_explore_frontier(unit, obs)
-        
-        # Elegir el nodo de reliquia con mayor prioridad (más cercano y menos disputado)
-        best_relic = None
-        best_score = -float('inf')
-        for relic in self.relic_nodes:
-            priority = self.relic_priority.get(relic, 0)
-            dist = abs(relic[0] - pos[0]) + abs(relic[1] - pos[1])
-            # Preferir nodos cercanos y con alta prioridad
-            score = priority - 0.5 * dist
-            if score > best_score:
-                best_score = score
-                best_relic = relic
-        
-        if best_relic:
-            dx = np.clip(best_relic[0] - pos[0], -1, 1)
-            dy = np.clip(best_relic[1] - pos[1], -1, 1)
-            return [dx, dy, 0, 0]
-        
-        return [0, 0, 0, 0]
-    
-    def _sanitize_action(self, action):
-        """Asegura que los valores estén en el rango permitido."""
-        # Movimiento: -1, 0, 1
-        action[0] = np.clip(action[0], -1, 1)
-        action[1] = np.clip(action[1], -1, 1)
-        # Sap: puede ser cualquier delta, pero limitamos a [-24,24] para evitar errores
-        if len(action) >= 4:
-            action[2] = np.clip(action[2], -24, 24)
-            action[3] = np.clip(action[3], -24, 24)
-        return action
-    
-    def reset(self):
-        """Reinicia el estado entre partidas (conserva conocimiento)."""
-        self.match_number += 1
-        self.step = 0
-        self.unit_roles = {}
-        self.unit_targets = {}
-        self.last_actions = {}
-        self.prev_energy = {}
-        # No reiniciamos el mapa ni los nodos (se mantienen)
-        # La exploración se reinicia en partida 1, pero en partidas 2-5 ya tenemos el mapa
+    def _is_adjacent_to_shed(self, x1, y1, x2, y2):
+        """Verifica si dos posiciones son adyacentes."""
+        return abs(x1 - x2) + abs(y1 - y2) == 1
