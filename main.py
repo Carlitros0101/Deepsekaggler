@@ -8,22 +8,31 @@ def main():
         return
     
     config = json.loads(data)
-    
     player = config.get("player", 0)
     env_cfg = config.get("env_cfg", {})
-    steps = config.get("steps", [])
     
     agent = Agent(player, env_cfg)
     
-    for step_data in steps:
-        obs = step_data.get("obs", {})
-        
-        # El agente devuelve las acciones
-        actions = agent.act(obs)
-        
-        # Enviar acciones como JSON
-        print(json.dumps(actions))
-        sys.stdout.flush()
+    # El entorno llama a act() en cada paso
+    # La función act recibe obs y devuelve acciones
+    # Pero en Kaggriculture, la función se llama con obs
+    # y se espera un dict con "farmer", "hands", "market"
+    
+    # Simplemente llamamos a agent.act(obs) en cada step
+    # El bucle lo maneja el entorno
+    # Esta función main es para compatibilidad con el formato de Kaggle
+    # En realidad, el entorno espera una función que recibe obs y devuelve actions
+    
+    # Para este agente, definimos una función wrapper
+    def agent_fn(obs):
+        return agent.act(obs)
+    
+    # El entorno ejecutará agent_fn directamente
+    # Así que retornamos la función
+    return agent_fn
 
 if __name__ == "__main__":
-    main()
+    # Si se ejecuta como script, se espera que la función principal retorne el agente
+    agent_fn = main()
+    # No hacemos nada más; el entorno llamará a agent_fn
+    pass
