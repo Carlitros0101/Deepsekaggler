@@ -1,0 +1,3 @@
+git add agent.py main.py
+git commit -m "Mejora masiva: roles, exploración por frontera, estimación de parámetros, ataque inteligente"
+git push origin main
