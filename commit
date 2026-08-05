@@ -1,3 +1,17 @@
-git add agent.py main.py
-git commit -m "Mejora masiva: roles, exploración por frontera, estimación de parámetros, ataque inteligente"
+
+---
+
+## 🚀 Cómo actualizar tu repositorio
+
+```bash
+# Clonar (si no lo has hecho)
+git clone https://github.com/Carlitros0101/Deepsekaggler.git
+cd Deepsekaggler
+
+# Reemplazar los archivos con los nuevos códigos
+# ... usa tu editor para copiar/pegar el contenido de agent.py, main.py y README.md
+
+# Subir los cambios
+git add agent.py main.py README.md
+git commit -m "Agente completo para Kaggriculture - estrategia de fases, mercado dinámico, animales"
 git push origin main
