@@ -1,0 +1,17 @@
+{
+  "params": {
+    "sell_threshold": 1.1,
+    "buy_threshold": 0.85,
+    "fert_price_limit": 80,
+    "land_invest_phase": 0.6,
+    "max_workers": 5,
+    "inventory_targets": {
+      "WHEAT": 10,
+      "CARROT": 5,
+      "TOMATO": 3,
+      "STRAWBERRY": 2,
+      "MELON": 2,
+      "FERTILIZER": 5
+    }
+  }
+}
